@@ -59,6 +59,7 @@
     <ClCompile Include="rlib-main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="rlib-format-utility.hpp" />
     <ClInclude Include="rlib-include.h" />
     <ClInclude Include="rlib-comptr.hpp" />
     <ClInclude Include="rlib-objects.h" />

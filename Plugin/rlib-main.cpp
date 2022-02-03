@@ -43,6 +43,7 @@
 #include "rlib-include.h"
 #include "rlib-resources.h"
 #include "rlib-objects.h"
+#include "rlib-format-utility.hpp"
 
 // Namespaces
 using namespace std;
@@ -316,7 +317,6 @@ struct RenderMetadata
     ID3D11Resource*             out;
     ID3D11VertexShader*         vs;
     ID3D11PixelShader*          ps;
-    ID3D11InputLayout*          il;
     reshadefx::pass_info*       pass;
     int                         pass_index;
 };
@@ -348,6 +348,16 @@ struct ShaderParameterInfo
     uint32_t    parameter_uints[16]     = {};
     rlib_t      parameter_type          = rlib_t::rlib_bool_t;
     uint16_t    parameter_count         = 0;
+};
+struct ID3D11RenderTargetViewX2
+{
+    com_ptr<ID3D11RenderTargetView>     renderTarget;
+    com_ptr<ID3D11RenderTargetView>     renderTarget_srgb;
+};
+struct ID3D11ShaderResourceViewX2
+{
+    com_ptr<ID3D11ShaderResourceView>     resourceView;
+    com_ptr<ID3D11ShaderResourceView>     resourceView_srgb;
 };
 
 // Defaults
@@ -402,6 +412,7 @@ private:
     bool _is_destorying                                     = false;
     bool _is_resetting                                      = false;
     bool _disabled                                          = false;
+    bool _srgb_write_enable                                 = false;
     bool _auto_parameter_update                             = true;
     ShaderID _id                                            = 0;
     string* _shaderCode                                     = 0;
@@ -414,8 +425,8 @@ private:
     UINT vpCount                                            = 1;
     UINT stride                                             = 0;
     UINT offset                                             = 0;
-    int colorBufferOffset                                   = 0;
-    int depthBufferOffset                                   = 0;
+    int colorBufferOffset                                   = -1;
+    int depthBufferOffset                                   = -1;
     int parameterCount                                      = 0;
 
     // Dirty Flags
@@ -436,22 +447,24 @@ private:
     vector<reshadefx::uniform_info>                         _uniforms;
 
     ID3D11RenderTargetView*                                 _rtvs[RTVS_COUNT];
-    vector<ID3D11SamplerState*>                             _smps;
-    ID3D11ShaderResourceView*                               _texViews[SRVS_COUNT];
     D3D11_VIEWPORT                                          _views[RTVS_COUNT];
+    vector<ID3D11ShaderResourceView*>                       _texViews;
+    vector<ID3D11SamplerState*>                             _smps;
+
 
     // Databases
     vector<Macro>                                           _macros;
     vector<ShaderParameter>                                 _parameters;
     ComDatabase(string, ID3D11Texture2D)                    _textures;
-    ComDatabase(string, ID3D11RenderTargetView)             _renderTargets;
-    ComDatabase(string, ID3D11ShaderResourceView)           _shaderViews;
+    PtrDatabase(string, ID3D11RenderTargetViewX2)           _renderTargets;
+    PtrDatabase(string, ID3D11ShaderResourceViewX2)         _shaderViews;
     ComDatabase(string, ID3D11SamplerState)                 _samplers;
     ComDatabase(string, ID3D11UnorderedAccessView)          _storageViews;
     ComDatabase(string, ID3D11VertexShader)                 _vertexShaders;
-    ComDatabase(string, ID3D11InputLayout)                  _inputLayouts;
     ComDatabase(string, ID3D11PixelShader)                  _pixelShaders;
     PtrDatabase(string, D3D11_VIEWPORT)                     _viewports;
+    ComDatabase(int, ID3D11BlendState)                      _blenders;
+    ComDatabase(int, ID3D11DepthStencilState)               _stencils;
 
     // DirectX Objects
     com_ptr<ID3D11Buffer>                                   uniformBuffer;
@@ -477,6 +490,8 @@ private:
     D3D11_SHADER_RESOURCE_VIEW_DESC                         srv_desc                = {};
     D3D11_RESOURCE_DIMENSION                                res_desc                = {};
     D3D11_SAMPLER_DESC                                      smp_desc                = {};
+    D3D11_BLEND_DESC                                        bln_desc                = {};
+    D3D10_DEPTH_STENCIL_DESC                                stn_desc                = {};
 
     // Timers & Performancers
     HighresClockDuration                                    frame_duration;
@@ -527,6 +542,17 @@ bool ReshadeEffect::CreateEffect()
     pp->add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
     for (size_t i = 0; i < _macros.size(); i++) pp->add_macro_definition(_macros[i].macro_id, _macros[i].macro_val);
 
+    // Add Converter Macros
+    pp->append_string(
+        "#define tex2Doffset(s, coords, offset) tex2D(s, coords, offset)\n"
+        "#define tex2Dlodoffset(s, coords, offset) tex2Dlod(s, coords, offset)\n"
+        "#define tex2Dgather(s, t, c) tex2Dgather##c(s, t)\n"
+        "#define tex2Dgatheroffset(s, t, o, c) tex2Dgather##c(s, t, o)\n"
+        "#define tex2Dgather0 tex2DgatherR\n"
+        "#define tex2Dgather1 tex2DgatherG\n"
+        "#define tex2Dgather2 tex2DgatherB\n"
+        "#define tex2Dgather3 tex2DgatherA\n");
+
     // Add Includes (This Makes Random VC++ Runtime Error)
     // pp->add_include_path(".\\Include"); 
 
@@ -547,14 +573,6 @@ bool ReshadeEffect::CreateEffect()
     }
     backend->write_result(*module);
 
-    // Create Layout Description
-    D3D11_INPUT_ELEMENT_DESC DefaultInputElements[] =
-    {
-        { "POSITION",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR",      0, DXGI_FORMAT_R8G8B8A8_UNORM,  0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "DIFFUSE",    0, DXGI_FORMAT_R8G8B8A8_UNORM,  0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-    };
-
     // Compile & Create DirectX 11 Shaders
     for (int i = 0; i < module->entry_points.size(); i++)
     {
@@ -573,9 +591,6 @@ bool ReshadeEffect::CreateEffect()
             ID3D11InputLayout* il;
             res = _Device->CreateVertexShader(shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr, &vs); DX_ERROR_CHECK;
             this->_vertexShaders.insert({ module->entry_points[i].name , vs });
-            res = _Device->CreateInputLayout(DefaultInputElements, _countof(DefaultInputElements), shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), &il);
-            if (FAILED(res)) log("DX Error : Input Layout for vertex shader [%s] failed to create, Set to Null.", module->entry_points[i].name.c_str());
-            this->_inputLayouts.insert({ module->entry_points[i].name , il });
             break;
         case reshadefx::shader_type::ps:
             ID3D11PixelShader* ps;
@@ -630,21 +645,60 @@ bool ReshadeEffect::CreateEffect()
         {
             D3D11_TEXTURE2D_DESC _desc = {}; D3D11_RENDER_TARGET_VIEW_DESC _rtvdesc = {};
             D3D11_SHADER_RESOURCE_VIEW_DESC _srvdesc = {}; D3DX11_IMAGE_LOAD_INFO texLoadInfo = {};
-            com_ptr<ID3D11Texture2D> _tex; com_ptr<ID3D11RenderTargetView> _rtv; com_ptr<ID3D11ShaderResourceView> _srv; 
+            com_ptr<ID3D11Texture2D> _tex; 
 
             // Create Descriptors
             _desc.Width = texture.width; _desc.Height = texture.height;
-            _desc.MipLevels = 1; _desc.ArraySize = 1;
-            _desc.Format = DEFAULT_COLOR_BUFFER_FORMAT;
-            _desc.SampleDesc.Count = 1; _desc.Usage = D3D11_USAGE_DEFAULT;
-            _desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            _desc.MipLevels = texture.levels; _desc.ArraySize = 1; _desc.SampleDesc = { 1, 0 };
+            switch (texture.format)
+            {
+            case reshadefx::texture_format::r8:
+                _desc.Format = DXGI_FORMAT_R8_UNORM;
+                break;
+            case reshadefx::texture_format::r16f:
+                _desc.Format = DXGI_FORMAT_R16_FLOAT;
+                break;
+            case reshadefx::texture_format::r32f:
+                _desc.Format = DXGI_FORMAT_R32_FLOAT;
+                break;
+            case reshadefx::texture_format::rg8:
+                _desc.Format = DXGI_FORMAT_R8G8_UNORM;
+                break;
+            case reshadefx::texture_format::rg16:
+                _desc.Format = DXGI_FORMAT_R16G16_UNORM;
+                break;
+            case reshadefx::texture_format::rg16f:
+                _desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+                break;
+            case reshadefx::texture_format::rg32f:
+                _desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+                break;
+            case reshadefx::texture_format::rgba8:
+                _desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+                break;
+            case reshadefx::texture_format::rgba16:
+                _desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+                break;
+            case reshadefx::texture_format::rgba16f:
+                _desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                break;
+            case reshadefx::texture_format::rgba32f:
+                _desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                break;
+            case reshadefx::texture_format::rgb10a2:
+                _desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+                break;
+            }
+            _desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (texture.levels > 1) _desc.MiscFlags |= D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            if (texture.render_target || texture.levels > 1) _desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
             _desc.CPUAccessFlags = 0; _desc.MiscFlags = 0;
 
-            _rtvdesc.Format = _desc.Format;
+            _rtvdesc.Format = make_dxgi_format_normal(_desc.Format);
             _rtvdesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
             _rtvdesc.Texture2D.MipSlice = 0;
 
-            _srvdesc.Format = _desc.Format;
+            _srvdesc.Format = make_dxgi_format_normal(_desc.Format);
             _srvdesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             _srvdesc.Texture2D.MipLevels = _desc.MipLevels;
 
@@ -654,7 +708,8 @@ bool ReshadeEffect::CreateEffect()
                 log("Loading Texture File `%s`...", textureSource.c_str());
 
                 // Load Texture from Disk
-                texLoadInfo.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                _desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                if (texture.render_target) _desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
                 texLoadInfo.CpuAccessFlags = 0;
                 texLoadInfo.Usage = D3D11_USAGE_DEFAULT;
                 texLoadInfo.MipLevels = 1; texLoadInfo.MiscFlags = 0;
@@ -682,11 +737,23 @@ bool ReshadeEffect::CreateEffect()
             }
    
             // Create Render Target View
-            res = _Device->CreateRenderTargetView(_tex.get(), &_rtvdesc, &_rtv); DX_ERROR_CHECK;
-            this->_renderTargets.insert({ texture.unique_name, _rtv });
+            if (texture.render_target)
+            {
+                ID3D11RenderTargetViewX2* _rtv = new ID3D11RenderTargetViewX2();
+                res = _Device->CreateRenderTargetView(_tex.get(), &_rtvdesc, &_rtv->renderTarget); DX_ERROR_CHECK;
+                _rtvdesc.Format = make_dxgi_format_srgb(_desc.Format);
+                res = _Device->CreateRenderTargetView(_tex.get(), &_rtvdesc, &_rtv->renderTarget_srgb); DX_ERROR_CHECK;
+                this->_renderTargets.insert({ texture.unique_name, _rtv });
+            }
 
             // Create Shader Resource View
-            res = _Device->CreateShaderResourceView(_tex.get(), &_srvdesc, &_srv); DX_ERROR_CHECK;
+            ID3D11ShaderResourceViewX2* _srv = new ID3D11ShaderResourceViewX2();
+            res = _Device->CreateShaderResourceView(_tex.get(), &_srvdesc, &_srv->resourceView); DX_ERROR_CHECK;
+            if (!hasSource)
+            {
+                _srvdesc.Format = make_dxgi_format_srgb(_desc.Format);
+                res = _Device->CreateShaderResourceView(_tex.get(), &_srvdesc, &_srv->resourceView_srgb); DX_ERROR_CHECK;
+            }
             this->_shaderViews.insert({ texture.unique_name, _srv });
 
             // Create Viewports
@@ -699,7 +766,109 @@ bool ReshadeEffect::CreateEffect()
             if (texture.semantic == "DEPTH") depthBufferOffset = texture.binding;
         }
     }
-   
+    
+    // Create Passes Resources
+    for (int pass_index = 0; pass_index < module->techniques[0].passes.size(); pass_index++)
+    {
+        const reshadefx::pass_info& pass = module->techniques[0].passes[pass_index];
+
+        // Create Blend State
+        {
+        com_ptr<ID3D11BlendState> _blend; D3D11_BLEND_DESC desc = {};
+        desc.AlphaToCoverageEnable = FALSE;
+        desc.IndependentBlendEnable = FALSE;
+        desc.RenderTarget[0].BlendEnable = pass.blend_enable;
+
+        const auto convert_blend_op = [](reshadefx::pass_blend_op value) 
+        {
+            switch (value)
+            {
+            default:
+            case reshadefx::pass_blend_op::add: return D3D11_BLEND_OP_ADD;
+            case reshadefx::pass_blend_op::subtract: return D3D11_BLEND_OP_SUBTRACT;
+            case reshadefx::pass_blend_op::rev_subtract: return D3D11_BLEND_OP_REV_SUBTRACT;
+            case reshadefx::pass_blend_op::min: return D3D11_BLEND_OP_MIN;
+            case reshadefx::pass_blend_op::max: return D3D11_BLEND_OP_MAX;
+            }
+        };
+        const auto convert_blend_func = [](reshadefx::pass_blend_func value) {
+            switch (value) {
+            case reshadefx::pass_blend_func::zero: return D3D11_BLEND_ZERO;
+            default:
+            case reshadefx::pass_blend_func::one: return D3D11_BLEND_ONE;
+            case reshadefx::pass_blend_func::src_color: return D3D11_BLEND_SRC_COLOR;
+            case reshadefx::pass_blend_func::src_alpha: return D3D11_BLEND_SRC_ALPHA;
+            case reshadefx::pass_blend_func::inv_src_color: return D3D11_BLEND_INV_SRC_COLOR;
+            case reshadefx::pass_blend_func::inv_src_alpha: return D3D11_BLEND_INV_SRC_ALPHA;
+            case reshadefx::pass_blend_func::dst_color: return D3D11_BLEND_DEST_COLOR;
+            case reshadefx::pass_blend_func::dst_alpha: return D3D11_BLEND_DEST_ALPHA;
+            case reshadefx::pass_blend_func::inv_dst_color: return D3D11_BLEND_INV_DEST_COLOR;
+            case reshadefx::pass_blend_func::inv_dst_alpha: return D3D11_BLEND_INV_DEST_ALPHA;
+            }
+        };
+
+        desc.RenderTarget[0].SrcBlend = convert_blend_func(pass.src_blend);
+        desc.RenderTarget[0].DestBlend = convert_blend_func(pass.dest_blend);
+        desc.RenderTarget[0].BlendOp = convert_blend_op(pass.blend_op);
+        desc.RenderTarget[0].SrcBlendAlpha = convert_blend_func(pass.src_blend_alpha);
+        desc.RenderTarget[0].DestBlendAlpha = convert_blend_func(pass.dest_blend_alpha);
+        desc.RenderTarget[0].BlendOpAlpha = convert_blend_op(pass.blend_op_alpha);
+        desc.RenderTarget[0].RenderTargetWriteMask = pass.color_write_mask;
+       
+        res = _Device->CreateBlendState(&desc, &_blend); DX_ERROR_CHECK;
+        this->_blenders.insert({ pass_index, _blend });
+        }
+
+
+        // Create Stincel State
+        {
+        com_ptr<ID3D11DepthStencilState> _stencil; D3D11_DEPTH_STENCIL_DESC desc;
+        desc.DepthEnable = FALSE;
+        desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+
+        const auto convert_stencil_op = [](reshadefx::pass_stencil_op value) {
+            switch (value) {
+            case reshadefx::pass_stencil_op::zero: return D3D11_STENCIL_OP_ZERO;
+            default:
+            case reshadefx::pass_stencil_op::keep: return D3D11_STENCIL_OP_KEEP;
+            case reshadefx::pass_stencil_op::invert: return D3D11_STENCIL_OP_INVERT;
+            case reshadefx::pass_stencil_op::replace: return D3D11_STENCIL_OP_REPLACE;
+            case reshadefx::pass_stencil_op::incr: return D3D11_STENCIL_OP_INCR;
+            case reshadefx::pass_stencil_op::incr_sat: return D3D11_STENCIL_OP_INCR_SAT;
+            case reshadefx::pass_stencil_op::decr: return D3D11_STENCIL_OP_DECR;
+            case reshadefx::pass_stencil_op::decr_sat: return D3D11_STENCIL_OP_DECR_SAT;
+            }
+        };
+        const auto convert_stencil_func = [](reshadefx::pass_stencil_func value) {
+            switch (value)
+            {
+            case reshadefx::pass_stencil_func::never: return D3D11_COMPARISON_NEVER;
+            case reshadefx::pass_stencil_func::equal: return D3D11_COMPARISON_EQUAL;
+            case reshadefx::pass_stencil_func::not_equal: return D3D11_COMPARISON_NOT_EQUAL;
+            case reshadefx::pass_stencil_func::less: return D3D11_COMPARISON_LESS;
+            case reshadefx::pass_stencil_func::less_equal: return D3D11_COMPARISON_LESS_EQUAL;
+            case reshadefx::pass_stencil_func::greater: return D3D11_COMPARISON_GREATER;
+            case reshadefx::pass_stencil_func::greater_equal: return D3D11_COMPARISON_GREATER_EQUAL;
+            default:
+            case reshadefx::pass_stencil_func::always: return D3D11_COMPARISON_ALWAYS;
+            }
+        };
+
+        desc.StencilEnable = pass.stencil_enable;
+        desc.StencilReadMask = pass.stencil_read_mask;
+        desc.StencilWriteMask = pass.stencil_write_mask;
+        desc.FrontFace.StencilFailOp = convert_stencil_op(pass.stencil_op_fail);
+        desc.FrontFace.StencilDepthFailOp = convert_stencil_op(pass.stencil_op_depth_fail);
+        desc.FrontFace.StencilPassOp = convert_stencil_op(pass.stencil_op_pass);
+        desc.FrontFace.StencilFunc = convert_stencil_func(pass.stencil_comparison_func);
+        desc.BackFace = desc.FrontFace;
+
+        res = _Device->CreateDepthStencilState(&desc, &_stencil); DX_ERROR_CHECK;
+        this->_stencils.insert({ pass_index, _stencil });
+        }
+    }
+
     // Create Samplers
     for (const reshadefx::sampler_info& sampler : module->samplers)
     {
@@ -831,22 +1000,37 @@ bool ReshadeEffect::Reset()
     // Clear Up Database Elements
     ResetComDatabase(_vertexShaders);
     ResetComDatabase(_pixelShaders);
-    ResetComDatabase(_inputLayouts);
     ResetComDatabase(_textures);
-    ResetComDatabase(_shaderViews);
     ResetComDatabase(_samplers);
     ResetComDatabase(_storageViews);
-    ResetComDatabase(_renderTargets);
+    ResetComDatabase(_blenders);
+    ResetComDatabase(_stencils);
     ResetPtrDatabase(_viewports);
+
+    // Clear Up Multi Databases
+    for (const auto& element : _renderTargets)
+    { 
+        auto _comobj = element.second; 
+        _comobj->renderTarget.reset();
+        _comobj->renderTarget_srgb.reset();
+    }
+    for (const auto& element : _shaderViews) 
+    { 
+        auto _comobj = element.second; 
+        _comobj->resourceView.reset();
+        _comobj->resourceView_srgb.reset();
+    }
+    ResetPtrDatabase(_renderTargets); ResetPtrDatabase(_shaderViews);
 
     // Clean Up Databases
     _vertexShaders.clear();
     _pixelShaders.clear();
-    _inputLayouts.clear();
     _renderTargets.clear();
     _textures.clear();
     _shaderViews.clear();
     _samplers.clear();
+    _blenders.clear();
+    _stencils.clear();
     _storageViews.clear();
     _viewports.clear();
     _passes.clear();
@@ -908,7 +1092,9 @@ bool ReshadeEffect::RenderEffect(ID3D11Resource* in, ID3D11Resource* in_depth, I
         vertSize = 12 + 4; stride = vertSize; offset = 0;
         _Context->UpdateSubresource(_VertexBuffer, 0, NULL, quadVerts, triangleCount * 3 * vertSize, 0);
         _Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        _Context->IASetVertexBuffers(0, 1, &_VertexBuffer, &stride, &offset);
+        const uintptr_t null = 0;
+        _Context->IASetInputLayout(nullptr);
+        _Context->IASetVertexBuffers(0, 1, reinterpret_cast<ID3D11Buffer* const*>(&null), reinterpret_cast<const UINT*>(&null), reinterpret_cast<const UINT*>(&null));
 
         in->GetType(&res_desc);
         if (res_desc == D3D11_RESOURCE_DIMENSION::D3D11_RESOURCE_DIMENSION_TEXTURE2D)
@@ -1075,7 +1261,6 @@ bool ReshadeEffect::RenderEffect(ID3D11Resource* in, ID3D11Resource* in_depth, I
                 rmd.in_depth = in_depth;
                 rmd.out = out;
                 rmd.vs = _vertexShaders[_passes[i].vs_entry_point].get();
-                rmd.il = _inputLayouts[_passes[i].vs_entry_point].get();
                 rmd.ps = _pixelShaders[_passes[i].ps_entry_point].get();
                 rmd.pass = &_passes[i];
                 rmd.pass_index = i;
@@ -1120,7 +1305,7 @@ bool ReshadeEffect::RenderPass(RenderMetadata& renderMeta)
     // Reset Holders
     for (size_t i = 0; i < RTVS_COUNT; i++) _rtvs[i] = nullptr;
     for (size_t i = 0; i < RTVS_COUNT; i++) _views[i] = defaultVP;
-    for (size_t i = 0; i < SRVS_COUNT; i++) _texViews[i] = nullptr;
+    _texViews.clear(); _texViews.resize(module->num_texture_bindings);
     _smps.clear(); _smps.resize(module->num_sampler_bindings);
 
     // Setup Render Targets
@@ -1129,7 +1314,11 @@ bool ReshadeEffect::RenderPass(RenderMetadata& renderMeta)
     {
         if (!renderMeta.pass->render_target_names[k].empty())
         {
-            _rtvs[k] = _renderTargets[renderMeta.pass->render_target_names[k]].get();
+            if (renderMeta.pass->srgb_write_enable)
+                _rtvs[k] = _renderTargets[renderMeta.pass->render_target_names[k]]->renderTarget_srgb.get();
+            else
+                _rtvs[k] = _renderTargets[renderMeta.pass->render_target_names[k]]->renderTarget.get();
+           
             if (renderMeta.pass->clear_render_targets) _Context->ClearRenderTargetView(_rtvs[k], clearColor);
             _views[k] = *_viewports[renderMeta.pass->render_target_names[k]];
         }
@@ -1148,9 +1337,18 @@ bool ReshadeEffect::RenderPass(RenderMetadata& renderMeta)
         }
     }
 
-    // Set Samplers
+    // Set Samplers & Textures
     for (const auto& _smp : module->samplers)
     {
+        const auto& shaderResource = _shaderViews[_smp.texture_name];
+        if (shaderResource)
+        {
+            if (_smp.srgb)
+                _texViews[_smp.texture_binding] = _shaderViews[_smp.texture_name]->resourceView_srgb.get();
+            else
+                _texViews[_smp.texture_binding] = _shaderViews[_smp.texture_name]->resourceView.get();
+        }
+
         _smps[_smp.binding] = _samplers[_smp.unique_name].get();
     }
     _Context->VSSetSamplers(0, _smps.size(), _smps.data());
@@ -1159,6 +1357,12 @@ bool ReshadeEffect::RenderPass(RenderMetadata& renderMeta)
     // Set Shaders
     _Context->VSSetShader(renderMeta.vs, NULL, 0);
     _Context->PSSetShader(renderMeta.ps, NULL, 0);
+
+    // Set Blend
+    _Context->OMSetBlendState(_blenders[renderMeta.pass_index].get(), nullptr, D3D11_DEFAULT_SAMPLE_MASK);
+
+    // Set Stencil
+    _Context->OMSetDepthStencilState(_stencils[renderMeta.pass_index].get(), renderMeta.pass->stencil_reference_value);
 
     // Set Uniforms
     if (hasParameters)
@@ -1169,22 +1373,15 @@ bool ReshadeEffect::RenderPass(RenderMetadata& renderMeta)
 
     // Set Internal Textures
     _texViews[colorBufferOffset] = colorBuffer.get();
-    _texViews[depthBufferOffset] = depthBuffer.get();
+    if (depthBufferOffset != -1) _texViews[depthBufferOffset] = depthBuffer.get();
     if (!useFlipBuffersModel) _texViews[depthBufferOffset] = depthBufferPre.get();
 
     // Set Textures
-    for (const auto& _tex : module->textures)
-    {
-        if (_tex.semantic == "")
-        {
-            _texViews[_tex.binding] = _shaderViews[_tex.unique_name].get();
-        }
-    }
-    _Context->VSSetShaderResources(0, SRVS_COUNT, _texViews);
-    _Context->PSSetShaderResources(0, SRVS_COUNT, _texViews);
+    _Context->VSSetShaderResources(0, _texViews.size(), _texViews.data());
+    _Context->PSSetShaderResources(0, _texViews.size(), _texViews.data());
 
     // Set Input Assembler Data
-    _Context->IASetInputLayout(renderMeta.il);
+    _Context->IASetInputLayout(NULL);
 
     // Draw & Render
     _Context->Draw(triangleCount * 3, 0);
